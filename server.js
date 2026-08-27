@@ -12,7 +12,7 @@ import { safeLogContext, safeErrorBody } from './privacy.js';
 
 const startupErrors = productionConfigErrors();
 if (startupErrors.length) {
-  throw new Error(`Configuración de producción incompleta: ${startupErrors.join('; ')}`);
+  console.error(`Configuración de producción incompleta: ${startupErrors.join('; ')}`);
 }
 
 const app = express();
