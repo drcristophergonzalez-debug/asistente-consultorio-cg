@@ -83,16 +83,54 @@ export async function createAppointment({ consultorio, code, fullName, phone, st
   const targetCalendar = calendarIdForConsultorio(consultorio);
   const normalizedPhone = normalizePhone(phone);
   const summary = `${code} ${normalizeName(fullName)} ${normalizedPhone}`.replace(/\s+/g, ' ').trim();
+
+  const startData = {
+    dateTime: DateTime.fromISO(start, { zone: config.timezone }).toISO(),
+    timeZone: config.timezone
+  };
+
+  const endData = {
+    dateTime: DateTime.fromISO(end, { zone: config.timezone }).toISO(),
+    timeZone: config.timezone
+  };
+
+  const requestBody = {
+    summary,
+    description: eventDescription({
+      type,
+      origin,
+      price,
+      consultorio,
+      reason,
+      phone: normalizedPhone
+    }),
+    start: startData,
+    end: endData
+  };
+
   const res = await calendar.events.insert({
     calendarId: targetCalendar,
-    requestBody: {
-      summary,
-      description: eventDescription({ type, origin, price, consultorio, reason, phone: normalizedPhone }),
-      start: { dateTime: DateTime.fromISO(start, { zone: config.timezone }).toISO(), timeZone: config.timezone },
-      end: { dateTime: DateTime.fromISO(end, { zone: config.timezone }).toISO(), timeZone: config.timezone }
-    }
+    requestBody
   });
-  return res.data;
+
+  let doctorEvent = null;
+
+  if (consultorio === CONSULTORIOS.MEXICO_AMERICANO) {
+    const doctorRes = await calendar.events.insert({
+      calendarId: config.calendars.doctor,
+      requestBody: {
+        ...requestBody,
+        description: `${requestBody.description}\nCopia para Confirmafy`
+      }
+    });
+
+    doctorEvent = doctorRes.data;
+  }
+
+  return {
+    ...res.data,
+    doctorEventId: doctorEvent?.id || null
+  };
 }
 
 export async function readAppointment({ consultorio, eventId }) {
@@ -112,7 +150,6 @@ export async function moveAppointment({ fromConsultorio, toConsultorio, eventId,
     return res.data;
   }
 
-  // Al cambiar de consultorio, copiamos campos seguros y luego liberamos el horario anterior.
   const src = original.data;
   const inserted = await calendar.events.insert({
     calendarId: targetId,
