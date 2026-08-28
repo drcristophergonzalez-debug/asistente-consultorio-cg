@@ -40,13 +40,21 @@ class ConversationStore {
   }
 
   async hydrate(phone) {
-    if (this.hydrated.has(phone)) {
-      return this.get(phone);
-    }
-
-    this.hydrated.add(phone);
-
+    /*
+     * En Firestore SIEMPRE volvemos a leer el estado persistido.
+     *
+     * Esto evita que una instancia de Cloud Run conserve en memoria un estado
+     * antiguo (por ejemplo humanMode=true) después de que Firestore haya sido
+     * actualizado.
+     *
+     * En memoria seguimos utilizando el caché local.
+     */
     if (config.stateBackend !== 'firestore') {
+      if (this.hydrated.has(phone)) {
+        return this.get(phone);
+      }
+
+      this.hydrated.add(phone);
       return this.get(phone);
     }
 
@@ -56,7 +64,11 @@ class ConversationStore {
 
     if (snap.exists) {
       this.conversations.set(phone, snap.data());
+    } else {
+      this.conversations.delete(phone);
     }
+
+    this.hydrated.add(phone);
 
     return this.get(phone);
   }
@@ -105,9 +117,7 @@ class ConversationStore {
   }
 
   async flush(phone) {
-    if (config.stateBackend !== 'firestore') {
-      return;
-    }
+    if (config.stateBackend !== 'firestore') return;
 
     await this.init();
 
@@ -117,16 +127,14 @@ class ConversationStore {
       return;
     }
 
-    if (!this.dirty.has(phone)) {
-      return;
-    }
+    if (!this.dirty.has(phone)) return;
 
     const value = this.get(phone);
 
     if (value) {
-      await this.collection
-        .doc(phone)
-        .set(value, { merge: false });
+      await this.collection.doc(phone).set(value, {
+        merge: false
+      });
     }
 
     this.dirty.delete(phone);
@@ -164,14 +172,10 @@ class ConversationStore {
       pauseHours = 2
     } = {}
   ) {
-    const date =
-      now instanceof Date
-        ? now
-        : new Date(now);
+    const date = now instanceof Date ? now : new Date(now);
 
     const pauseUntil = new Date(
-      date.getTime() +
-      pauseHours * 60 * 60 * 1000
+      date.getTime() + pauseHours * 60 * 60 * 1000
     );
 
     return this.patch(
@@ -205,10 +209,9 @@ class ConversationStore {
       };
     }
 
-    const date =
-      now instanceof Date
-        ? now
-        : new Date(now);
+    const date = now instanceof Date
+      ? now
+      : new Date(now);
 
     if (!state.humanPauseUntil) {
       return {
@@ -218,9 +221,7 @@ class ConversationStore {
       };
     }
 
-    const until = new Date(
-      state.humanPauseUntil
-    );
+    const until = new Date(state.humanPauseUntil);
 
     if (
       Number.isNaN(until.getTime()) ||
@@ -286,8 +287,7 @@ class ConversationStore {
       phone,
       {
         depositRequired: true,
-        depositReason:
-          reason || 'ADMINISTRATIVE',
+        depositReason: reason || 'ADMINISTRATIVE',
         depositAmount: Number(amount || 0),
         depositTariffCode: tariffCode,
         depositSince: this.nowIso(now)
