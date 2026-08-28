@@ -26,8 +26,6 @@ async function ensurePatientClassification({ phone, state, intent, detectedSourc
   const source = sourceFor({ detectedSource, intent, state });
   const fullName = intent.fullName || state.fullName || null;
 
-  // Para promociones de Facebook la validación es deliberadamente más estricta:
-  // primero teléfono y, si no existe antecedente, nombre antes de conceder FB4.
   if (source === 'FACEBOOK') {
     const byPhone = await findPatientHistory({ phone });
     if (byPhone.events.length) {
@@ -80,79 +78,197 @@ async function offerAvailability({ phone, state, intent, classification }) {
     conversationStore.patch(phone, { next: 'WAITING_PROMO_NAME', resumeIntent: intent, resumeSource: classification.source });
     return { reply: FAQ.askName, next: 'WAITING_PROMO_NAME' };
   }
+
   if (classification.decision.requiresHuman) {
     if (classification.decision.reason === 'NOSHOW') {
       const prev = classifyHistory(classification.history.events);
       const billing = billingForClass(prev?.patientClass || PATIENT_CLASS.REGULAR);
       return { reply: `Con gusto podemos ayudarle a programar una nueva cita. Debido a que tenemos registrada una inasistencia en su cita anterior, para realizar una nueva reservación se requiere un anticipo del 50% del costo de la consulta (*$${billing.price / 2}*). Este anticipo se abona al total al acudir a su cita y, en caso de no presentarse, no es reembolsable. Permítame canalizar su mensaje para ayudarle con el proceso.`, handoff: true };
     }
-    if (classification.decision.reason === 'VERIFY_REFERRED_PROMO') return { reply: FAQ.referredPromo, handoff: false, next: 'WAITING_REFERRER' };
+
+    if (classification.decision.reason === 'VERIFY_REFERRED_PROMO') {
+      return { reply: FAQ.referredPromo, handoff: false, next: 'WAITING_REFERRER' };
+    }
+
     return { reply: FAQ.verifyPromo, handoff: true };
   }
 
   const patientClass = classification.decision.patientClass;
   const from = intent.requestedDateISO || DateTime.now().setZone(config.timezone).toISODate();
   const days = intent.requestedDateISO ? 1 : 14;
+
   let slots;
-  if (intent.consultorio) slots = await availableSlots({ patientClass, consultorio: intent.consultorio, from, days, limit: 20 });
-  else slots = await availableSlotsBothConsultorios({ patientClass, from, days, limit: 20 });
+
+  if (intent.consultorio) {
+    slots = await availableSlots({
+      patientClass,
+      consultorio: intent.consultorio,
+      from,
+      days,
+      limit: 20
+    });
+  } else {
+    slots = await availableSlotsBothConsultorios({
+      patientClass,
+      from,
+      days,
+      limit: 20
+    });
+  }
+
   slots = filterByIntent(slots, intent);
 
   if (!slots.length) return { reply: FAQ.noAvailability };
+
   conversationStore.patch(phone, {
-    offeredSlots: slots.map(s => ({ consultorio: s.consultorio, start: s.start.toISO(), end: s.end.toISO() })),
+    offeredSlots: slots.map(s => ({
+      consultorio: s.consultorio,
+      start: s.start.toISO(),
+      end: s.end.toISO()
+    })),
     patientClass,
     code: classification.decision.code,
     price: classification.decision.price
   });
-  const priorRegularPromoNotice = classification.source === 'FACEBOOK' && classification.decision.patientClass === PATIENT_CLASS.REGULAR && classification.history.events.length
-    ? `${FAQ.previousRegularNoPromo}\n\n`
-    : '';
-  return { reply: `${priorRegularPromoNotice}${formatSlots(slots)}\n\n¿Cuál de estos horarios le funciona mejor?` };
+
+  const priorRegularPromoNotice =
+    classification.source === 'FACEBOOK' &&
+    classification.decision.patientClass === PATIENT_CLASS.REGULAR &&
+    classification.history.events.length
+      ? `${FAQ.previousRegularNoPromo}\n\n`
+      : '';
+
+  return {
+    reply: `${priorRegularPromoNotice}${formatSlots(slots)}\n\n¿Cuál de estos horarios le funciona mejor?`
+  };
 }
 
 function selectedSlotFromState(state, intent) {
   const offered = state.offeredSlots || [];
+
   const candidates = offered.filter(s => {
     const dt = DateTime.fromISO(s.start, { zone: config.timezone });
+
     if (intent.consultorio && s.consultorio !== intent.consultorio) return false;
     if (intent.requestedDateISO && dt.toISODate() !== intent.requestedDateISO) return false;
     if (intent.requestedTimeHHMM && dt.toFormat('HH:mm') !== intent.requestedTimeHHMM) return false;
+
     return true;
   });
+
   return candidates.length === 1 ? candidates[0] : null;
 }
 
 async function bookSelected({ phone, state, intent, detectedSource }) {
-  const classification = await ensurePatientClassification({ phone, state, intent, detectedSource });
-  if (classification.decision.requiresName || classification.decision.requiresHuman) return offerAvailability({ phone, state, intent, classification });
+  const classification = await ensurePatientClassification({
+    phone,
+    state,
+    intent,
+    detectedSource
+  });
 
-  let slot = state.pendingSlot || selectedSlotFromState({ ...state, ...classification.state }, intent);
+  if (classification.decision.requiresName || classification.decision.requiresHuman) {
+    return offerAvailability({
+      phone,
+      state,
+      intent,
+      classification
+    });
+  }
+
+  let slot = state.pendingSlot || selectedSlotFromState(
+    { ...state, ...classification.state },
+    intent
+  );
+
   if (!slot && intent.consultorio && intent.requestedDateISO && intent.requestedTimeHHMM) {
-    const start = DateTime.fromISO(`${intent.requestedDateISO}T${intent.requestedTimeHHMM}`, { zone: config.timezone });
-    const minStart = DateTime.now().setZone(config.timezone).plus({ hours: 12 });
-    if (start >= minStart && isAllowedExactSlot(classification.decision.patientClass, intent.consultorio, start)) {
-      slot = { consultorio: intent.consultorio, start: start.toISO(), end: start.plus({ minutes: APPOINTMENT_MINUTES }).toISO() };
+    const start = DateTime.fromISO(
+      `${intent.requestedDateISO}T${intent.requestedTimeHHMM}`,
+      { zone: config.timezone }
+    );
+
+    const minStart = DateTime.now()
+      .setZone(config.timezone)
+      .plus({ hours: 12 });
+
+    if (
+      start >= minStart &&
+      isAllowedExactSlot(
+        classification.decision.patientClass,
+        intent.consultorio,
+        start
+      )
+    ) {
+      slot = {
+        consultorio: intent.consultorio,
+        start: start.toISO(),
+        end: start.plus({ minutes: APPOINTMENT_MINUTES }).toISO()
+      };
     }
   }
-  if (!slot) return offerAvailability({ phone, state: classification.state, intent, classification });
+
+  if (!slot) {
+    return offerAvailability({
+      phone,
+      state: classification.state,
+      intent,
+      classification
+    });
+  }
 
   const fullName = intent.fullName || classification.state.fullName;
+
   if (!fullName) {
-    conversationStore.patch(phone, { pendingSlot: slot, patientClass: classification.decision.patientClass, code: classification.decision.code, price: classification.decision.price });
-    return { reply: FAQ.askName, next: 'WAITING_NAME' };
-  }
-  const reason = intent.reason || classification.state.reason;
-  if (!reason) {
-    conversationStore.patch(phone, { fullName, pendingSlot: slot });
-    return { reply: FAQ.askReason, next: 'WAITING_REASON' };
+    conversationStore.patch(phone, {
+      pendingSlot: slot,
+      patientClass: classification.decision.patientClass,
+      code: classification.decision.code,
+      price: classification.decision.price
+    });
+
+    return {
+      reply: FAQ.askName,
+      next: 'WAITING_NAME'
+    };
   }
 
-  const free = await isSlotAvailable({ consultorio: slot.consultorio, start: slot.start, end: slot.end });
+  const reason = intent.reason || classification.state.reason;
+
+  if (!reason) {
+    conversationStore.patch(phone, {
+      fullName,
+      pendingSlot: slot
+    });
+
+    return {
+      reply: FAQ.askReason,
+      next: 'WAITING_REASON'
+    };
+  }
+
+  const free = await isSlotAvailable({
+    consultorio: slot.consultorio,
+    start: slot.start,
+    end: slot.end
+  });
+
   if (!free) {
-    conversationStore.patch(phone, { offeredSlots: [], pendingSlot: null });
-    const alternatives = await availableSlots({ patientClass: classification.decision.patientClass, consultorio: slot.consultorio, from: DateTime.fromISO(slot.start).toISODate(), days: 7, limit: 8 });
-    return { reply: `Ese horario acaba de dejar de estar disponible. Estos son los espacios más cercanos:\n\n${formatSlots(alternatives, 8)}\n\n¿Cuál le funciona mejor?` };
+    conversationStore.patch(phone, {
+      offeredSlots: [],
+      pendingSlot: null
+    });
+
+    const alternatives = await availableSlots({
+      patientClass: classification.decision.patientClass,
+      consultorio: slot.consultorio,
+      from: DateTime.fromISO(slot.start).toISODate(),
+      days: 7,
+      limit: 8
+    });
+
+    return {
+      reply: `Ese horario acaba de dejar de estar disponible. Estos son los espacios más cercanos:\n\n${formatSlots(alternatives, 8)}\n\n¿Cuál le funciona mejor?`
+    };
   }
 
   const event = await createAppointment({
@@ -167,104 +283,352 @@ async function bookSelected({ phone, state, intent, detectedSource }) {
     price: classification.decision.price,
     reason
   });
-  conversationStore.patch(phone, { eventId: event.id, consultorio: slot.consultorio, fullName, reason, pendingSlot: null, offeredSlots: [] });
-  return { reply: `Su cita ha quedado agendada para el *${formatSlot({ consultorio: slot.consultorio, start: DateTime.fromISO(slot.start), end: DateTime.fromISO(slot.end) })}*.\n\nSi posteriormente necesita realizar algún cambio, puede escribirnos por este mismo medio.`, booked: true, event };
+
+  conversationStore.patch(phone, {
+    eventId: event.id,
+    doctorEventId: event.doctorEventId || null,
+    consultorio: slot.consultorio,
+    fullName,
+    reason,
+    pendingSlot: null,
+    offeredSlots: []
+  });
+
+  return {
+    reply: `Su cita ha quedado agendada para el *${formatSlot({
+      consultorio: slot.consultorio,
+      start: DateTime.fromISO(slot.start),
+      end: DateTime.fromISO(slot.end)
+    })}*.\n\nSi posteriormente necesita realizar algún cambio, puede escribirnos por este mismo medio.`,
+    booked: true,
+    event
+  };
 }
 
 async function continuePending({ phone, state, intent, text, detectedSource }) {
   if (state.next === 'WAITING_PROMO_NAME') {
     const fullName = intent.fullName || text.trim();
-    const resumeIntent = { ...(state.resumeIntent || {}), fullName };
-    conversationStore.patch(phone, { fullName, next: null, resumeIntent: null });
-    return processIntent({ phone, text, intent: resumeIntent, detectedSource: state.resumeSource || detectedSource });
+    const resumeIntent = {
+      ...(state.resumeIntent || {}),
+      fullName
+    };
+
+    conversationStore.patch(phone, {
+      fullName,
+      next: null,
+      resumeIntent: null
+    });
+
+    return processIntent({
+      phone,
+      text,
+      intent: resumeIntent,
+      detectedSource: state.resumeSource || detectedSource
+    });
   }
+
   if (state.next === 'WAITING_REFERRER') {
-    conversationStore.patch(phone, { referrerName: text, next: null, requiresHuman: true });
-    return { reply: FAQ.verifyPromo, handoff: true };
+    conversationStore.patch(phone, {
+      referrerName: text,
+      next: null,
+      requiresHuman: true
+    });
+
+    return {
+      reply: FAQ.verifyPromo,
+      handoff: true
+    };
   }
+
   if (state.next === 'WAITING_NAME') {
     const fullName = intent.fullName || text.trim();
-    conversationStore.patch(phone, { fullName, next: state.reason ? null : 'WAITING_REASON' });
-    if (!state.reason) return { reply: FAQ.askReason, next: 'WAITING_REASON' };
-    return bookSelected({ phone, state: { ...state, fullName }, intent: { ...intent, fullName, reason: state.reason }, detectedSource });
+
+    conversationStore.patch(phone, {
+      fullName,
+      next: state.reason ? null : 'WAITING_REASON'
+    });
+
+    if (!state.reason) {
+      return {
+        reply: FAQ.askReason,
+        next: 'WAITING_REASON'
+      };
+    }
+
+    return bookSelected({
+      phone,
+      state: { ...state, fullName },
+      intent: { ...intent, fullName, reason: state.reason },
+      detectedSource
+    });
   }
+
   if (state.next === 'WAITING_REASON') {
     const reason = intent.reason || text.trim();
-    conversationStore.patch(phone, { reason, next: null });
-    return bookSelected({ phone, state: { ...state, reason }, intent: { ...intent, fullName: state.fullName, reason }, detectedSource });
+
+    conversationStore.patch(phone, {
+      reason,
+      next: null
+    });
+
+    return bookSelected({
+      phone,
+      state: { ...state, reason },
+      intent: {
+        ...intent,
+        fullName: state.fullName,
+        reason
+      },
+      detectedSource
+    });
   }
+
   return null;
 }
 
 async function handleReschedule({ phone, state, intent, detectedSource }) {
-  const upcoming = await findUpcomingAppointments({ phone, fullName: state.fullName });
-  if (!upcoming.length) return { reply: 'No encontramos una cita futura asociada a este número. Permítame canalizar su mensaje para revisarlo.', handoff: true };
-  if (upcoming.length > 1 && !state.rescheduleEventId) {
-    const text = upcoming.slice(0, 4).map((e, i) => `${i + 1}. ${formatSlot({ consultorio: e.consultorio, start: DateTime.fromISO(e.start.dateTime), end: DateTime.fromISO(e.end.dateTime) })}`).join('\n');
-    return { reply: `Encontramos más de una cita futura:\n\n${text}\n\n¿Cuál desea modificar?`, handoff: true };
+  const upcoming = await findUpcomingAppointments({
+    phone,
+    fullName: state.fullName
+  });
+
+  if (!upcoming.length) {
+    return {
+      reply: 'No encontramos una cita futura asociada a este número. Permítame canalizar su mensaje para revisarlo.',
+      handoff: true
+    };
   }
-  const current = (state.rescheduleEventId ? upcoming.find(e => e.id === state.rescheduleEventId) : null) || upcoming[0];
-  const currentStart = DateTime.fromISO(current.start.dateTime, { zone: config.timezone });
-  const hours = currentStart.diff(DateTime.now().setZone(config.timezone), 'hours').hours;
+
+  if (upcoming.length > 1 && !state.rescheduleEventId) {
+    const text = upcoming
+      .slice(0, 4)
+      .map((e, i) =>
+        `${i + 1}. ${formatSlot({
+          consultorio: e.consultorio,
+          start: DateTime.fromISO(e.start.dateTime),
+          end: DateTime.fromISO(e.end.dateTime)
+        })}`
+      )
+      .join('\n');
+
+    return {
+      reply: `Encontramos más de una cita futura:\n\n${text}\n\n¿Cuál desea modificar?`,
+      handoff: true
+    };
+  }
+
+  const current =
+    (state.rescheduleEventId
+      ? upcoming.find(e => e.id === state.rescheduleEventId)
+      : null) || upcoming[0];
+
+  const currentStart = DateTime.fromISO(
+    current.start.dateTime,
+    { zone: config.timezone }
+  );
+
+  const hours = currentStart.diff(
+    DateTime.now().setZone(config.timezone),
+    'hours'
+  ).hours;
+
   if (hours < 24) {
     const parsed = classifyHistory([current]);
     const price = billingForClass(parsed?.patientClass).price;
-    return { reply: `Podemos ayudarle a realizar el cambio. Debido a que faltan menos de 24 horas para su cita, para reservar una nueva fecha se solicita un anticipo equivalente al 50% del costo de la consulta (*$${price / 2}*), mismo que se abona al total cuando acuda. Permítame canalizar su mensaje para ayudarle con el cambio.`, handoff: true };
+
+    return {
+      reply: `Podemos ayudarle a realizar el cambio. Debido a que faltan menos de 24 horas para su cita, para reservar una nueva fecha se solicita un anticipo equivalente al 50% del costo de la consulta (*$${price / 2}*), mismo que se abona al total cuando acuda. Permítame canalizar su mensaje para ayudarle con el cambio.`,
+      handoff: true
+    };
   }
 
-  if (!intent.requestedDateISO && !intent.requestedTimeHHMM && !intent.consultorio) {
-    conversationStore.patch(phone, { rescheduleEventId: current.id, rescheduleFromConsultorio: current.consultorio });
-    return { reply: `Claro. Tenemos registrada su cita para el *${formatSlot({ consultorio: current.consultorio, start: currentStart, end: DateTime.fromISO(current.end.dateTime) })}*. ¿A qué fecha u horario le gustaría cambiarla?` };
+  if (
+    !intent.requestedDateISO &&
+    !intent.requestedTimeHHMM &&
+    !intent.consultorio
+  ) {
+    conversationStore.patch(phone, {
+      rescheduleEventId: current.id,
+      rescheduleFromConsultorio: current.consultorio
+    });
+
+    return {
+      reply: `Claro. Tenemos registrada su cita para el *${formatSlot({
+        consultorio: current.consultorio,
+        start: currentStart,
+        end: DateTime.fromISO(current.end.dateTime)
+      })}*. ¿A qué fecha u horario le gustaría cambiarla?`
+    };
   }
 
-  const history = await findPatientHistory({ phone, fullName: state.fullName });
-  const previous = classifyHistory(history.events) || { patientClass: PATIENT_CLASS.REGULAR };
+  const history = await findPatientHistory({
+    phone,
+    fullName: state.fullName
+  });
+
+  const previous =
+    classifyHistory(history.events) || {
+      patientClass: PATIENT_CLASS.REGULAR
+    };
+
   const patientClass = previous.patientClass;
 
   const selectedOffered = selectedSlotFromState(state, intent);
+
   if (selectedOffered) {
-    const free = await isSlotAvailable({ consultorio: selectedOffered.consultorio, start: selectedOffered.start, end: selectedOffered.end });
-    if (!free) return { reply: 'Ese horario acaba de dejar de estar disponible. Permítame revisar otras opciones.' };
-    const moved = await moveAppointment({ fromConsultorio: current.consultorio, toConsultorio: selectedOffered.consultorio, eventId: current.id, newStart: selectedOffered.start, newEnd: selectedOffered.end });
-    conversationStore.patch(phone, { rescheduleEventId: null, rescheduleFromConsultorio: null, offeredSlots: [] });
-    return { reply: `Listo. Su cita quedó reagendada para el *${formatSlot({ consultorio: selectedOffered.consultorio, start: DateTime.fromISO(selectedOffered.start), end: DateTime.fromISO(selectedOffered.end) })}*.`, moved };
+    const free = await isSlotAvailable({
+      consultorio: selectedOffered.consultorio,
+      start: selectedOffered.start,
+      end: selectedOffered.end
+    });
+
+    if (!free) {
+      return {
+        reply: 'Ese horario acaba de dejar de estar disponible. Permítame revisar otras opciones.'
+      };
+    }
+
+    const moved = await moveAppointment({
+      fromConsultorio: current.consultorio,
+      toConsultorio: selectedOffered.consultorio,
+      eventId: current.id,
+      newStart: selectedOffered.start,
+      newEnd: selectedOffered.end
+    });
+
+    conversationStore.patch(phone, {
+      rescheduleEventId: null,
+      rescheduleFromConsultorio: null,
+      offeredSlots: []
+    });
+
+    return {
+      reply: `Listo. Su cita quedó reagendada para el *${formatSlot({
+        consultorio: selectedOffered.consultorio,
+        start: DateTime.fromISO(selectedOffered.start),
+        end: DateTime.fromISO(selectedOffered.end)
+      })}*.`,
+      moved
+    };
   }
 
-  const targetConsultorio = intent.consultorio || current.consultorio;
-  let slots = await availableSlots({ patientClass, consultorio: targetConsultorio, from: intent.requestedDateISO || DateTime.now().toISODate(), days: intent.requestedDateISO ? 1 : 14, limit: 12 });
+  const targetConsultorio =
+    intent.consultorio || current.consultorio;
+
+  let slots = await availableSlots({
+    patientClass,
+    consultorio: targetConsultorio,
+    from: intent.requestedDateISO || DateTime.now().toISODate(),
+    days: intent.requestedDateISO ? 1 : 14,
+    limit: 12
+  });
+
   slots = filterByIntent(slots, intent);
-  if (!slots.length) return { reply: FAQ.noAvailability };
-  if (!(intent.requestedDateISO && intent.requestedTimeHHMM) || slots.length !== 1) {
-    conversationStore.patch(phone, { rescheduleEventId: current.id, rescheduleFromConsultorio: current.consultorio, offeredSlots: slots.map(s => ({ consultorio: s.consultorio, start: s.start.toISO(), end: s.end.toISO() })) });
-    return { reply: `${formatSlots(slots)}\n\n¿Cuál horario prefiere para realizar el cambio?` };
+
+  if (!slots.length) {
+    return { reply: FAQ.noAvailability };
+  }
+
+  if (
+    !(intent.requestedDateISO && intent.requestedTimeHHMM) ||
+    slots.length !== 1
+  ) {
+    conversationStore.patch(phone, {
+      rescheduleEventId: current.id,
+      rescheduleFromConsultorio: current.consultorio,
+      offeredSlots: slots.map(s => ({
+        consultorio: s.consultorio,
+        start: s.start.toISO(),
+        end: s.end.toISO()
+      }))
+    });
+
+    return {
+      reply: `${formatSlots(slots)}\n\n¿Cuál horario prefiere para realizar el cambio?`
+    };
   }
 
   const target = slots[0];
-  const free = await isSlotAvailable({ consultorio: target.consultorio, start: target.start.toISO(), end: target.end.toISO() });
-  if (!free) return { reply: 'Ese horario acaba de dejar de estar disponible. Permítame revisar otras opciones.' };
-  const moved = await moveAppointment({ fromConsultorio: current.consultorio, toConsultorio: target.consultorio, eventId: current.id, newStart: target.start.toISO(), newEnd: target.end.toISO() });
-  conversationStore.patch(phone, { rescheduleEventId: null, rescheduleFromConsultorio: null, offeredSlots: [] });
-  return { reply: `Listo. Su cita quedó reagendada para el *${formatSlot(target)}*.`, moved };
+
+  const free = await isSlotAvailable({
+    consultorio: target.consultorio,
+    start: target.start.toISO(),
+    end: target.end.toISO()
+  });
+
+  if (!free) {
+    return {
+      reply: 'Ese horario acaba de dejar de estar disponible. Permítame revisar otras opciones.'
+    };
+  }
+
+  const moved = await moveAppointment({
+    fromConsultorio: current.consultorio,
+    toConsultorio: target.consultorio,
+    eventId: current.id,
+    newStart: target.start.toISO(),
+    newEnd: target.end.toISO()
+  });
+
+  conversationStore.patch(phone, {
+    rescheduleEventId: null,
+    rescheduleFromConsultorio: null,
+    offeredSlots: []
+  });
+
+  return {
+    reply: `Listo. Su cita quedó reagendada para el *${formatSlot(target)}*.`,
+    moved
+  };
 }
 
 async function handleCancel({ phone, state }) {
-  const upcoming = await findUpcomingAppointments({ phone, fullName: state.fullName });
-  if (!upcoming.length) return { reply: 'No encontramos una cita futura asociada a este número. Permítame canalizar su mensaje para revisarlo.', handoff: true };
-  if (upcoming.length > 1) return { reply: 'Encontramos más de una cita futura asociada a este número. Permítame canalizar su mensaje para confirmar cuál desea cancelar.', handoff: true };
+  const upcoming = await findUpcomingAppointments({
+    phone,
+    fullName: state.fullName
+  });
+
+  if (!upcoming.length) {
+    return {
+      reply: 'No encontramos una cita futura asociada a este número. Permítame canalizar su mensaje para revisarlo.',
+      handoff: true
+    };
+  }
+
+  if (upcoming.length > 1) {
+    return {
+      reply: 'Encontramos más de una cita futura asociada a este número. Permítame canalizar su mensaje para confirmar cuál desea cancelar.',
+      handoff: true
+    };
+  }
+
   const current = upcoming[0];
-  const currentStart = DateTime.fromISO(current.start.dateTime, { zone: config.timezone });
-  const hours = currentStart.diff(DateTime.now().setZone(config.timezone), 'hours').hours;
+
+  const currentStart = DateTime.fromISO(
+    current.start.dateTime,
+    { zone: config.timezone }
+  );
+
+  const hours = currentStart.diff(
+    DateTime.now().setZone(config.timezone),
+    'hours'
+  ).hours;
+
   if (hours < 24) {
     const parsed = classifyHistory([current]);
     const billing = billingForClass(parsed?.patientClass);
-    // La cancelación tardía libera el horario inmediatamente, pero deja una
-    // incidencia persistente para que la siguiente reservación requiera anticipo.
-    await cancelAppointment({ consultorio: current.consultorio, eventId: current.id });
+
+    await cancelAppointment({
+      consultorio: current.consultorio,
+      eventId: current.id
+    });
+
     conversationStore.markDepositRequired(phone, {
       reason: 'LATE_CANCEL',
       amount: billing.price / 2,
       tariffCode: billing.code
     });
+
     return {
       reply: `Hemos cancelado su cita y el horario ha quedado liberado. Debido a que la cancelación se realiza con menos de 24 horas de anticipación, para una nueva reservación se solicitará un anticipo del 50% del costo de la consulta (*$${billing.price / 2}*), mismo que se abona al total cuando acuda. Permítame canalizar su mensaje para ayudarle con el proceso.`,
       handoff: true,
@@ -272,37 +636,87 @@ async function handleCancel({ phone, state }) {
       lateCancellation: true
     };
   }
-  await cancelAppointment({ consultorio: current.consultorio, eventId: current.id });
-  return { reply: 'Claro. Hemos cancelado su cita y el horario ha quedado liberado. Cuando guste podemos ayudarle a programar una nueva fecha.', cancelled: true };
+
+  await cancelAppointment({
+    consultorio: current.consultorio,
+    eventId: current.id
+  });
+
+  return {
+    reply: 'Claro. Hemos cancelado su cita y el horario ha quedado liberado. Cuando guste podemos ayudarle a programar una nueva fecha.',
+    cancelled: true
+  };
 }
 
-export async function processIntent({ phone, text, intent, detectedSource = 'REGULAR' }) {
+export async function processIntent({
+  phone,
+  text,
+  intent,
+  detectedSource = 'REGULAR'
+}) {
   phone = normalizePhone(phone);
-  let state = conversationStore.get(phone) || { phone };
-  if (intent.fullName) state = conversationStore.patch(phone, { fullName: intent.fullName });
-  if (intent.reason) state = conversationStore.patch(phone, { reason: intent.reason });
 
-  const pending = await continuePending({ phone, state, intent, text, detectedSource });
+  let state = conversationStore.get(phone) || { phone };
+
+  if (intent.fullName) {
+    state = conversationStore.patch(phone, {
+      fullName: intent.fullName
+    });
+  }
+
+  if (intent.reason) {
+    state = conversationStore.patch(phone, {
+      reason: intent.reason
+    });
+  }
+
+  const pending = await continuePending({
+    phone,
+    state,
+    intent,
+    text,
+    detectedSource
+  });
+
   if (pending) {
-    if (pending.next) conversationStore.patch(phone, { next: pending.next });
+    if (pending.next) {
+      conversationStore.patch(phone, {
+        next: pending.next
+      });
+    }
+
     return pending;
   }
 
-  if (state.rescheduleEventId && ['BOOK', 'AVAILABILITY', 'RESCHEDULE'].includes(intent.intent)) {
-    return handleReschedule({ phone, state, intent, detectedSource });
+  if (
+    state.rescheduleEventId &&
+    ['BOOK', 'AVAILABILITY', 'RESCHEDULE'].includes(intent.intent)
+  ) {
+    return handleReschedule({
+      phone,
+      state,
+      intent,
+      detectedSource
+    });
   }
 
-  // Incidencias administrativas persistentes: una cancelación tardía previamente
-  // registrada requiere intervención humana antes de una nueva reservación. Si
-  // ya existe una cita futura creada por el doctor/consultorio, entendemos que
-  // el caso fue validado manualmente y limpiamos la incidencia.
-  if (state.depositRequired && ['BOOK', 'AVAILABILITY', 'PRICE'].includes(intent.intent)) {
-    const upcomingAfterManualReview = await findUpcomingAppointments({ phone, fullName: state.fullName });
+  if (
+    state.depositRequired &&
+    ['BOOK', 'AVAILABILITY', 'PRICE'].includes(intent.intent)
+  ) {
+    const upcomingAfterManualReview =
+      await findUpcomingAppointments({
+        phone,
+        fullName: state.fullName
+      });
+
     if (upcomingAfterManualReview.length) {
       state = conversationStore.clearDepositRequirement(phone);
     } else {
       const amount = Number(state.depositAmount || 0);
-      const amountText = amount > 0 ? ` (*$${amount}*)` : '';
+      const amountText =
+        amount > 0 ? ` (*$${amount}*)` : '';
+
       return {
         reply: `Con gusto podemos ayudarle. Debido a un antecedente administrativo en una cita previa, para realizar una nueva reservación se requiere un anticipo del 50% del costo de la consulta${amountText}. Este anticipo se abona al total al acudir a su cita. Permítame canalizar su mensaje para ayudarle con el proceso.`,
         handoff: true,
@@ -311,61 +725,229 @@ export async function processIntent({ phone, text, intent, detectedSource = 'REG
     }
   }
 
-  if (intent.intent === 'MEDICAL_EMERGENCY') return { reply: FAQ.emergency, handoff: true, emergency: true };
-  if (intent.intent === 'URGENT_APPOINTMENT') return { reply: FAQ.urgentAppointment, handoff: true, urgent: true };
-  if (intent.intent === 'HUMAN') return { reply: FAQ.human, handoff: true };
-  if (intent.intent === 'DOCTOR') return { reply: FAQ.doctor, handoff: true };
-  if (intent.intent === 'GREETING') return { reply: FAQ.greeting };
-  if (intent.intent === 'INSURANCE') return { reply: FAQ.insurance };
-  if (intent.intent === 'WHAT_TO_BRING') return { reply: FAQ.whatToBring };
-  if (intent.intent === 'SURGERY_PRICE') return { reply: FAQ.surgeryPrice };
-  if (intent.intent === 'PAYMENT') return { reply: 'El pago de la consulta puede realizarse en *efectivo, transferencia, tarjeta de débito o tarjeta de crédito*.' };
+  if (intent.intent === 'MEDICAL_EMERGENCY') {
+    return {
+      reply: FAQ.emergency,
+      handoff: true,
+      emergency: true
+    };
+  }
+
+  if (intent.intent === 'URGENT_APPOINTMENT') {
+    return {
+      reply: FAQ.urgentAppointment,
+      handoff: true,
+      urgent: true
+    };
+  }
+
+  if (intent.intent === 'HUMAN') {
+    return {
+      reply: FAQ.human,
+      handoff: true
+    };
+  }
+
+  if (intent.intent === 'DOCTOR') {
+    return {
+      reply: FAQ.doctor,
+      handoff: true
+    };
+  }
+
+  if (intent.intent === 'GREETING') {
+    return { reply: FAQ.greeting };
+  }
+
+  if (intent.intent === 'INSURANCE') {
+    return { reply: FAQ.insurance };
+  }
+
+  if (intent.intent === 'WHAT_TO_BRING') {
+    return { reply: FAQ.whatToBring };
+  }
+
+  if (intent.intent === 'SURGERY_PRICE') {
+    return { reply: FAQ.surgeryPrice };
+  }
+
+  if (intent.intent === 'PAYMENT') {
+    return {
+      reply: 'El pago de la consulta puede realizarse en *efectivo, transferencia, tarjeta de débito o tarjeta de crédito*.'
+    };
+  }
+
   if (intent.intent === 'LOCATION') {
-    if (intent.consultorio === CONSULTORIOS.SAN_SERAFIN) return { reply: FAQ.sanSerafinLocation };
-    if (intent.consultorio === CONSULTORIOS.MEXICO_AMERICANO) return { reply: FAQ.mexicoLocation };
-    return { reply: `${FAQ.mexicoLocation}\n\n${FAQ.sanSerafinLocation}` };
+    if (intent.consultorio === CONSULTORIOS.SAN_SERAFIN) {
+      return { reply: FAQ.sanSerafinLocation };
+    }
+
+    if (intent.consultorio === CONSULTORIOS.MEXICO_AMERICANO) {
+      return { reply: FAQ.mexicoLocation };
+    }
+
+    return {
+      reply: `${FAQ.mexicoLocation}\n\n${FAQ.sanSerafinLocation}`
+    };
   }
+
   if (intent.intent === 'CONDITION') {
-    if (intent.conditionCategory === 'CLEAR_NEUROSURGERY') return { reply: FAQ.conditionClear };
-    if (intent.conditionCategory === 'INITIAL_ASSESSMENT') return { reply: FAQ.conditionInitial };
-    if (intent.conditionCategory === 'OTHER_SPECIALTY') return { reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para revisarlo personalmente y orientarle de la forma adecuada.', handoff: true, outOfScope: true };
-    return { reply: 'Los síntomas que describe pueden tener diferentes causas y es necesario realizar una valoración para determinar su origen. Si gusta, podemos revisar los próximos horarios disponibles.' };
+    if (intent.conditionCategory === 'CLEAR_NEUROSURGERY') {
+      return { reply: FAQ.conditionClear };
+    }
+
+    if (intent.conditionCategory === 'INITIAL_ASSESSMENT') {
+      return { reply: FAQ.conditionInitial };
+    }
+
+    if (intent.conditionCategory === 'OTHER_SPECIALTY') {
+      return {
+        reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para revisarlo personalmente y orientarle de la forma adecuada.',
+        handoff: true,
+        outOfScope: true
+      };
+    }
+
+    return {
+      reply: 'Los síntomas que describe pueden tener diferentes causas y es necesario realizar una valoración para determinar su origen. Si gusta, podemos revisar los próximos horarios disponibles.'
+    };
   }
-  if (intent.intent === 'OTHER') return { reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para atenderlo personalmente.', handoff: true, outOfScope: true };
-  if (intent.needsHuman) return { reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para atenderlo personalmente.', handoff: true, outOfScope: true };
-  if (intent.intent === 'RESCHEDULE') return handleReschedule({ phone, state, intent, detectedSource });
-  if (intent.intent === 'CANCEL') return handleCancel({ phone, state });
+
+  if (intent.intent === 'OTHER') {
+    return {
+      reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para atenderlo personalmente.',
+      handoff: true,
+      outOfScope: true
+    };
+  }
+
+  if (intent.needsHuman) {
+    return {
+      reply: 'Gracias por escribirnos. Permítame canalizar su mensaje para atenderlo personalmente.',
+      handoff: true,
+      outOfScope: true
+    };
+  }
+
+  if (intent.intent === 'RESCHEDULE') {
+    return handleReschedule({
+      phone,
+      state,
+      intent,
+      detectedSource
+    });
+  }
+
+  if (intent.intent === 'CANCEL') {
+    return handleCancel({
+      phone,
+      state
+    });
+  }
 
   if (intent.intent === 'PRICE') {
-    const classification = await ensurePatientClassification({ phone, state, intent, detectedSource });
+    const classification = await ensurePatientClassification({
+      phone,
+      state,
+      intent,
+      detectedSource
+    });
+
     if (classification.decision.requiresName) {
-      conversationStore.patch(phone, { next: 'WAITING_PROMO_NAME', resumeIntent: intent, resumeSource: classification.source });
+      conversationStore.patch(phone, {
+        next: 'WAITING_PROMO_NAME',
+        resumeIntent: intent,
+        resumeSource: classification.source
+      });
+
       return { reply: FAQ.askName };
     }
+
     if (classification.decision.requiresHuman) {
       if (classification.decision.reason === 'VERIFY_REFERRED_PROMO') {
-        conversationStore.patch(phone, { next: 'WAITING_REFERRER' });
+        conversationStore.patch(phone, {
+          next: 'WAITING_REFERRER'
+        });
+
         return { reply: FAQ.referredPromo };
       }
-      if (classification.decision.reason === 'NOSHOW') return { reply: 'Para poder confirmar la tarifa y una nueva reservación, permítame canalizar su mensaje debido al antecedente registrado.', handoff: true };
-      return { reply: FAQ.verifyPromo, handoff: true };
+
+      if (classification.decision.reason === 'NOSHOW') {
+        return {
+          reply: 'Para poder confirmar la tarifa y una nueva reservación, permítame canalizar su mensaje debido al antecedente registrado.',
+          handoff: true
+        };
+      }
+
+      return {
+        reply: FAQ.verifyPromo,
+        handoff: true
+      };
     }
-    if (classification.decision.patientClass === PATIENT_CLASS.FB_FIRST) return { reply: FAQ.fbFirstPrice };
-    if (classification.decision.patientClass === PATIENT_CLASS.FB_FOLLOWUP) return { reply: FAQ.fbFollowupPrice };
-    if (classification.decision.patientClass === PATIENT_CLASS.REGULAR && classification.source === 'FACEBOOK' && classification.history.events.length) return { reply: FAQ.previousRegularNoPromo };
+
+    if (classification.decision.patientClass === PATIENT_CLASS.FB_FIRST) {
+      return { reply: FAQ.fbFirstPrice };
+    }
+
+    if (classification.decision.patientClass === PATIENT_CLASS.FB_FOLLOWUP) {
+      return { reply: FAQ.fbFollowupPrice };
+    }
+
+    if (
+      classification.decision.patientClass === PATIENT_CLASS.REGULAR &&
+      classification.source === 'FACEBOOK' &&
+      classification.history.events.length
+    ) {
+      return { reply: FAQ.previousRegularNoPromo };
+    }
+
     return { reply: FAQ.regularPrice };
   }
 
-  if (intent.intent === 'BOOK' || intent.intent === 'AVAILABILITY') {
-    const classification = await ensurePatientClassification({ phone, state, intent, detectedSource });
-    if (classification.source === 'REFERRED_PROMO' && classification.decision.requiresHuman) {
-      conversationStore.patch(phone, { next: 'WAITING_REFERRER' });
+  if (
+    intent.intent === 'BOOK' ||
+    intent.intent === 'AVAILABILITY'
+  ) {
+    const classification = await ensurePatientClassification({
+      phone,
+      state,
+      intent,
+      detectedSource
+    });
+
+    if (
+      classification.source === 'REFERRED_PROMO' &&
+      classification.decision.requiresHuman
+    ) {
+      conversationStore.patch(phone, {
+        next: 'WAITING_REFERRER'
+      });
+
       return { reply: FAQ.referredPromo };
     }
-    // Si ya eligió un horario concreto, intentamos reservar; de lo contrario ofrecemos disponibilidad.
-    if (intent.requestedDateISO && intent.requestedTimeHHMM) return bookSelected({ phone, state: classification.state, intent, detectedSource });
-    return offerAvailability({ phone, state: classification.state, intent, classification });
+
+    if (
+      intent.requestedDateISO &&
+      intent.requestedTimeHHMM
+    ) {
+      return bookSelected({
+        phone,
+        state: classification.state,
+        intent,
+        detectedSource
+      });
+    }
+
+    return offerAvailability({
+      phone,
+      state: classification.state,
+      intent,
+      classification
+    });
   }
 
-  return { reply: FAQ.unknown, handoff: true };
+  return {
+    reply: FAQ.unknown,
+    handoff: true
+  };
 }
